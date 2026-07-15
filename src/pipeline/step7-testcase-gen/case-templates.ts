@@ -30,6 +30,7 @@ import path from "node:path";
 import type { TestCase, TestCaseCatalog, TestCaseCategory } from "../../ai/test-catalog.js";
 import type { FeatureName } from "../step4-feature-discovery/types.js";
 import { dirForGame } from "../registry/paths.js";
+import { operatorForSlug } from "../registry/meta.js";
 import { featureRegistry } from "../registry/feature-registry-store.js";
 import { gameSpecOverride } from "../registry/game-spec-override.js";
 import { uiRegistry } from "../registry/ui-registry.js";
@@ -805,6 +806,420 @@ export async function resetCaseTemplatesOverride(): Promise<string> {
   return TEMPLATE_OVERRIDE_PATH;
 }
 
+// ---------------------------------------------------------------------------
+// Per-operator (OC) rule overrides.
+//
+// A tester scopes a case-generation tweak to an operator "oc". Every FUTURE
+// game of that oc, at generation time, has the tweak applied — see the
+// oc-overlay step in applyTemplateSet. Stored one file per oc under
+// fixtures/case-templates/by-oc/<oc>.json as an array of entries, each one of:
+//   - a FULL CaseTemplate  → replaces (verbatim, no AI rewrite) or adds a case by id
+//   - a PATCH { id, ... }  → mutates the existing case in place (works on the
+//        AI-generated per-game case too — matched by text, not fixed wording):
+//        · removeSteps: [txt]       drop setup steps containing a substring
+//        · addSteps: [txt]          append setup steps (auto-numbered)
+//        · addAssertions: [{...}]   add custom assertions ("rules")
+//        · removeAssertions: [id]   drop custom assertions by id
+//   - { id, _remove: true } → drops the case entirely for this oc.
+// Precedence at generation: built-in / standard.json (master) → oc override.
+// ---------------------------------------------------------------------------
+
+/** An action-level patch op — mutates the TRANSLATED actions of a case (works
+ *  even on empty-setup cases whose actions are synthesized, not from setup).
+ *
+ *  Targeting (for cases with duplicate actions like several `wait 1500ms`):
+ *   - `at`: 1-based ABSOLUTE index into the action list (e.g. at:6 = action #6).
+ *   - `nth`: 1-based OCCURRENCE among actions matching this op (e.g. the 2nd
+ *            `wait_ms` with from:1500). More robust to leading changes.
+ *   - neither → applies to ALL matches (change every wait 1500, remove every X).
+ *  `at` wins over `nth` when both are set. */
+export type ActionMatch = { kind?: string; uiKey?: string };
+export type ActionPatchOp =
+  | { op: "setWaitMs"; to: number; from?: number; at?: number; nth?: number }
+  | { op: "removeActions"; match?: ActionMatch; at?: number; nth?: number }
+  | { op: "insertAfter" | "insertBefore"; match?: ActionMatch; at?: number; nth?: number; action: Record<string, unknown> };
+
+/** A patch entry mutates one case in place instead of replacing it wholesale. */
+export type OcPatchEntry = {
+  id: string;
+  /** Replace the whole setup_instructions with this text (you write the steps,
+   *  the AI translator turns them into actions). Keeps name/category/etc. */
+  setSetup?: string;
+  removeSteps?: string[];
+  addSteps?: string[];
+  addAssertions?: Array<{ id: string; description?: string; check_code: string }>;
+  removeAssertions?: string[];
+  /** Ops applied to the translated actions AFTER setup→actions translation. */
+  actionPatches?: ActionPatchOp[];
+};
+
+/** One entry in a per-oc override file. */
+export type OcTemplateOverrideEntry =
+  | CaseTemplate
+  | { id: string; _remove: true }
+  | OcPatchEntry;
+
+const PATCH_KEYS = ["setSetup", "removeSteps", "addSteps", "addAssertions", "removeAssertions", "actionPatches"] as const;
+
+type ActionLike = { kind: string; ms?: number; uiKey?: string; [k: string]: unknown };
+
+/** Apply action-level patch ops to a translated action list. Pure + exported
+ *  for tests. Ops: setWaitMs (change wait_ms durations), removeActions (drop by
+ *  kind/uiKey), insertBefore/insertAfter (splice a new action around matches). */
+export function applyActionPatches(actions: ActionLike[], ops: ActionPatchOp[]): ActionLike[] {
+  const matchFn = (m?: ActionMatch) => (a: ActionLike) =>
+    !m || ((m.kind === undefined || a.kind === m.kind) && (m.uiKey === undefined || a.uiKey === m.uiKey));
+  let out = [...actions];
+  for (const op of ops) {
+    if (op.op === "setWaitMs") {
+      if (op.at !== undefined) {
+        const i = op.at - 1;
+        if (i >= 0 && i < out.length && out[i]!.kind === "wait_ms") out[i] = { ...out[i]!, ms: op.to };
+      } else if (op.nth !== undefined) {
+        let n = 0;
+        out = out.map((a) => {
+          if (a.kind === "wait_ms" && (op.from === undefined || a.ms === op.from)) { n++; if (n === op.nth) return { ...a, ms: op.to }; }
+          return a;
+        });
+      } else {
+        out = out.map((a) => (a.kind === "wait_ms" && (op.from === undefined || a.ms === op.from) ? { ...a, ms: op.to } : a));
+      }
+    } else if (op.op === "removeActions") {
+      const f = matchFn(op.match);
+      if (op.at !== undefined) {
+        const i = op.at - 1;
+        if (i >= 0 && i < out.length && f(out[i]!)) out = out.filter((_, idx) => idx !== i);
+      } else if (op.nth !== undefined) {
+        let n = 0; const keep: ActionLike[] = [];
+        for (const a of out) { if (f(a)) { n++; if (n === op.nth) continue; } keep.push(a); }
+        out = keep;
+      } else {
+        out = out.filter((a) => !f(a));
+      }
+    } else if (op.op === "insertAfter" || op.op === "insertBefore") {
+      const f = matchFn(op.match);
+      const before = op.op === "insertBefore";
+      const res: ActionLike[] = [];
+      if (op.at !== undefined) {
+        const i = op.at - 1;
+        for (let idx = 0; idx < out.length; idx++) {
+          if (before && idx === i) res.push({ ...(op.action as ActionLike) });
+          res.push(out[idx]!);
+          if (!before && idx === i) res.push({ ...(op.action as ActionLike) });
+        }
+      } else if (op.nth !== undefined) {
+        let n = 0;
+        for (const a of out) {
+          const hit = f(a) && ++n === op.nth;
+          if (before && hit) res.push({ ...(op.action as ActionLike) });
+          res.push(a);
+          if (!before && hit) res.push({ ...(op.action as ActionLike) });
+        }
+      } else {
+        for (const a of out) {
+          if (before && f(a)) res.push({ ...(op.action as ActionLike) });
+          res.push(a);
+          if (!before && f(a)) res.push({ ...(op.action as ActionLike) });
+        }
+      }
+      out = res;
+    }
+  }
+  return out;
+}
+
+/** True when a patch entry carries action-level ops. */
+export function hasActionPatches(e: OcTemplateOverrideEntry): e is OcPatchEntry & { actionPatches: ActionPatchOp[] } {
+  return Array.isArray((e as OcPatchEntry).actionPatches) && (e as OcPatchEntry).actionPatches!.length > 0;
+}
+
+/**
+ * Apply per-operator action-level patches to a game's translated actions cache.
+ * Resolves the game's oc, reads its override entries, and for each entry with
+ * `actionPatches` mutates the matching case's actions in `test-cases.actions.json`.
+ * Idempotent via a per-case signature so re-running over an unchanged cache
+ * won't double-apply non-idempotent ops (insertAfter/Before). Call AFTER every
+ * setup→actions translation (generate + re-translate). Pass opts.caseId to
+ * limit to one case (per-case Re-translate).
+ */
+export async function applyOcActionOverlay(
+  slug: string,
+  opts: { caseId?: string } = {},
+): Promise<{ patched: number }> {
+  const oc = await operatorForSlug(slug);
+  if (!oc) return { patched: 0 };
+  const entries = await loadOcTemplateOverride(oc);
+  if (!entries) return { patched: 0 };
+  const withActions = entries.filter(hasActionPatches);
+  if (withActions.length === 0) return { patched: 0 };
+
+  const { loadCache, saveCache } = await import("./case-action-translator.js");
+  const cache = await loadCache(slug);
+  if (!cache) return { patched: 0 };
+
+  let patched = 0;
+  for (const e of withActions) {
+    if (opts.caseId && e.id !== opts.caseId) continue;
+    const entry = cache.cases[e.id];
+    if (!entry) continue;
+    const sig = JSON.stringify(e.actionPatches);
+    if (entry.ocPatchSig === sig) continue; // already applied identical ops
+    entry.actions = applyActionPatches(entry.actions as ActionLike[], e.actionPatches) as typeof entry.actions;
+    entry.ocPatchSig = sig;
+    patched++;
+  }
+  if (patched > 0) {
+    cache.generatedAt = new Date().toISOString();
+    await saveCache(slug, cache);
+    console.log(`[case-templates/oc-action-overlay] ${slug} oc=${oc}: patched ${patched} case(s)`);
+  }
+  return { patched };
+}
+
+/** True when an entry is a patch (has at least one patch op, not a full template). */
+export function isPatchEntry(e: OcTemplateOverrideEntry): e is OcPatchEntry {
+  if ((e as { _remove?: unknown })._remove === true) return false;
+  return PATCH_KEYS.some((k) => (e as Record<string, unknown>)[k] !== undefined);
+}
+
+/**
+ * Remove any step from a `setup_instructions` string whose text contains one of
+ * `needles` (case-insensitive substring match), then renumber remaining
+ * "Step N:" prefixes. Handles the catalog's canonical "Step 1: … Step 2: …"
+ * format (steps may be on one line or many) and falls back to newline/sentence
+ * splitting when the text isn't numbered. Returns the setup unchanged when
+ * nothing matches. Exported for tests + reuse by the oc-overlay.
+ */
+export function applyStepRemoval(setup: string, needles: string[]): string {
+  const text = (setup ?? "").trim();
+  if (!text || needles.length === 0) return setup ?? "";
+  const matches = (s: string) => needles.some((n) => n.trim() && s.toLowerCase().includes(n.trim().toLowerCase()));
+
+  const hasNumbered = /(^|\s)step\s*\d+\s*:/i.test(text);
+  if (hasNumbered) {
+    // Split into segments each starting at a "Step N:" marker.
+    const parts = text.split(/(?=(?:^|\s)step\s*\d+\s*:)/i).map((s) => s.trim()).filter(Boolean);
+    const kept = parts.filter((p) => !matches(p));
+    // Renumber the leading "Step N:" of each kept segment.
+    let n = 0;
+    const renumbered = kept.map((p) => {
+      if (/^step\s*\d+\s*:/i.test(p)) { n += 1; return p.replace(/^step\s*\d+\s*:/i, `Step ${n}:`); }
+      return p;
+    });
+    return renumbered.join(" ").trim();
+  }
+
+  // Unnumbered: split on newlines if multiline, else on sentence boundaries.
+  const sep = /\n/.test(text) ? /\n+/ : /(?<=\.)\s+/;
+  const parts = text.split(sep).map((s) => s.trim()).filter(Boolean);
+  const kept = parts.filter((p) => !matches(p));
+  return kept.join(/\n/.test(text) ? "\n" : " ").trim();
+}
+
+/** Append steps to a setup string, continuing "Step N:" numbering when the
+ *  setup is numbered (falls back to newline/space join otherwise). Any
+ *  "Step N:" prefix the caller included in a step text is stripped + replaced
+ *  with the correct running number. */
+export function appendSteps(setup: string, steps: string[]): string {
+  const additions = steps.map((s) => (s ?? "").trim()).filter(Boolean);
+  const text = (setup ?? "").trim();
+  if (additions.length === 0) return setup ?? "";
+  if (!text) return additions.map((s, i) => `Step ${i + 1}: ${s.replace(/^step\s*\d+\s*:\s*/i, "")}`).join(" ");
+  const hasNumbered = /(^|\s)step\s*\d+\s*:/i.test(text);
+  if (hasNumbered) {
+    let n = Math.max(0, ...[...text.matchAll(/step\s*(\d+)\s*:/ig)].map((m) => Number(m[1])));
+    const numbered = additions.map((s) => `Step ${++n}: ${s.replace(/^step\s*\d+\s*:\s*/i, "")}`);
+    return [text, ...numbered].join(" ").trim();
+  }
+  const sep = /\n/.test(text) ? "\n" : " ";
+  return [text, ...additions].join(sep).trim();
+}
+
+/** Apply a patch to a case-shaped object (CaseTemplate or TestCase), returning
+ *  a new object with setup steps + custom assertions mutated in place. */
+export function applyCasePatch<T extends { setup_instructions?: string; custom_assertions?: Array<{ id: string; description?: string; check_code: string }> }>(
+  caseObj: T,
+  patch: OcPatchEntry,
+): T {
+  let setup = caseObj.setup_instructions ?? "";
+  if (patch.setSetup !== undefined) setup = patch.setSetup; // full setup replace (you write it, AI translates)
+  if (patch.removeSteps?.length) setup = applyStepRemoval(setup, patch.removeSteps);
+  if (patch.addSteps?.length) setup = appendSteps(setup, patch.addSteps);
+  let assertions = [...(caseObj.custom_assertions ?? [])];
+  if (patch.removeAssertions?.length) {
+    const drop = new Set(patch.removeAssertions);
+    assertions = assertions.filter((a) => !drop.has(a.id));
+  }
+  if (patch.addAssertions?.length) {
+    const seen = new Set(assertions.map((a) => a.id));
+    for (const a of patch.addAssertions) {
+      if (seen.has(a.id)) continue;
+      assertions.push({ id: a.id, description: a.description ?? "", check_code: a.check_code });
+      seen.add(a.id);
+    }
+  }
+  return { ...caseObj, setup_instructions: setup, custom_assertions: assertions };
+}
+
+export const OC_TEMPLATES_DIR = path.join("fixtures", "case-templates", "by-oc");
+
+/** Sanitize an oc code for safe use as a filename (prevents path traversal). */
+export function sanitizeOc(oc: string): string {
+  return oc.trim().toLowerCase().replace(/[^a-z0-9._-]/g, "");
+}
+
+export function ocOverridePath(oc: string): string {
+  return path.join(OC_TEMPLATES_DIR, `${sanitizeOc(oc)}.json`);
+}
+
+/** Validate a per-oc override payload. Each entry must have an id; a
+ *  `{ id, _remove: true }` entry needs only the id, otherwise the entry must be
+ *  a complete valid CaseTemplate. */
+export function validateOcTemplateOverride(
+  value: unknown,
+): { ok: true; entries: OcTemplateOverrideEntry[] } | { ok: false; reason: string } {
+  if (!Array.isArray(value)) return { ok: false, reason: "oc override payload must be a JSON array" };
+  const ids = new Set<string>();
+  for (const [idx, item] of value.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { ok: false, reason: `entry[${idx}] must be an object` };
+    }
+    const e = item as Record<string, unknown>;
+    if (!e.id || typeof e.id !== "string") return { ok: false, reason: `entry[${idx}].id is required` };
+    if (ids.has(e.id)) return { ok: false, reason: `duplicate id "${e.id}"` };
+    ids.add(e.id);
+    if (e._remove === true) continue; // removal marker — only id required
+    const hasPatchKey = PATCH_KEYS.some((k) => k in e);
+    if (hasPatchKey) {
+      // Patch entry: setSetup and/or step/assertion/action ops.
+      if (e.setSetup !== undefined && (typeof e.setSetup !== "string" || !e.setSetup.trim())) {
+        return { ok: false, reason: `entry "${e.id}" setSetup must be a non-empty string` };
+      }
+      for (const k of ["removeSteps", "addSteps", "removeAssertions"] as const) {
+        if (e[k] === undefined) continue;
+        if (!Array.isArray(e[k]) || (e[k] as unknown[]).length === 0) {
+          return { ok: false, reason: `entry "${e.id}" ${k} must be a non-empty array` };
+        }
+        if (!(e[k] as unknown[]).every((s) => typeof s === "string" && s.trim())) {
+          return { ok: false, reason: `entry "${e.id}" ${k} must contain non-empty strings` };
+        }
+      }
+      if (e.addAssertions !== undefined) {
+        if (!Array.isArray(e.addAssertions) || e.addAssertions.length === 0) {
+          return { ok: false, reason: `entry "${e.id}" addAssertions must be a non-empty array` };
+        }
+        for (const [ai, a] of (e.addAssertions as unknown[]).entries()) {
+          const asr = a as Record<string, unknown>;
+          if (!asr || typeof asr !== "object" || typeof asr.id !== "string" || !asr.id.trim()) {
+            return { ok: false, reason: `entry "${e.id}" addAssertions[${ai}].id is required` };
+          }
+          if (typeof asr.check_code !== "string" || !asr.check_code.trim()) {
+            return { ok: false, reason: `entry "${e.id}" addAssertions[${ai}].check_code is required` };
+          }
+        }
+      }
+      if (e.actionPatches !== undefined) {
+        if (!Array.isArray(e.actionPatches) || e.actionPatches.length === 0) {
+          return { ok: false, reason: `entry "${e.id}" actionPatches must be a non-empty array` };
+        }
+        for (const [pi, p0] of (e.actionPatches as unknown[]).entries()) {
+          const p = p0 as Record<string, unknown>;
+          const where = `entry "${e.id}" actionPatches[${pi}]`;
+          if (!p || typeof p !== "object") return { ok: false, reason: `${where} must be an object` };
+          // Optional targeting shared by all ops.
+          for (const k of ["at", "nth"] as const) {
+            if (p[k] !== undefined && (typeof p[k] !== "number" || !Number.isInteger(p[k]) || (p[k] as number) < 1)) {
+              return { ok: false, reason: `${where}.${k} must be a positive integer (1-based)` };
+            }
+          }
+          const hasMatch = () => {
+            const m = p.match as Record<string, unknown> | undefined;
+            return !!m && typeof m === "object" && (m.kind !== undefined || m.uiKey !== undefined);
+          };
+          if (p.op === "setWaitMs") {
+            if (typeof p.to !== "number") return { ok: false, reason: `${where}.to must be a number` };
+            if (p.from !== undefined && typeof p.from !== "number") return { ok: false, reason: `${where}.from must be a number` };
+          } else if (p.op === "removeActions") {
+            if (!hasMatch() && p.at === undefined) return { ok: false, reason: `${where} needs match (kind/uiKey) or at (index)` };
+          } else if (p.op === "insertAfter" || p.op === "insertBefore") {
+            if (!hasMatch() && p.at === undefined) return { ok: false, reason: `${where} needs match (kind/uiKey) or at (index)` };
+            const act = p.action as Record<string, unknown> | undefined;
+            if (!act || typeof act !== "object" || typeof act.kind !== "string") {
+              return { ok: false, reason: `${where}.action must have a kind` };
+            }
+          } else {
+            return { ok: false, reason: `${where}.op must be setWaitMs | removeActions | insertBefore | insertAfter` };
+          }
+        }
+      }
+      continue;
+    }
+    const one = validateCaseTemplates([item]);
+    if (!one.ok) return { ok: false, reason: one.reason };
+  }
+  return { ok: true, entries: value as OcTemplateOverrideEntry[] };
+}
+
+/** Load the raw per-oc override entries, or null when no file exists. */
+export async function loadOcTemplateOverride(oc: string): Promise<OcTemplateOverrideEntry[] | null> {
+  try {
+    const raw = await readFile(ocOverridePath(oc), "utf8");
+    const parsed = JSON.parse(raw);
+    const valid = validateOcTemplateOverride(parsed);
+    return valid.ok ? valid.entries : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveOcTemplateOverride(oc: string, entries: unknown): Promise<string> {
+  const valid = validateOcTemplateOverride(entries);
+  if (!valid.ok) throw new Error(valid.reason);
+  const file = ocOverridePath(oc);
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(valid.entries, null, 2) + "\n", "utf8");
+  return file;
+}
+
+export async function resetOcTemplateOverride(oc: string): Promise<string> {
+  const file = ocOverridePath(oc);
+  await rm(file, { force: true });
+  return file;
+}
+
+/**
+ * Load the effective template set for an operator: the master set (override
+ * file or built-in) with the oc override applied on top — same-id entries
+ * REPLACE the master case, new ids are appended, `_remove` entries drop the
+ * case. When `oc` is null/empty or has no override file, returns the master
+ * set unchanged.
+ */
+export async function loadCaseTemplatesForOc(
+  oc?: string | null,
+): Promise<{ templates: CaseTemplate[]; source: "override-file" | "built-in"; oc: string | null; ocCount: number }> {
+  const base = await loadCaseTemplates();
+  if (!oc) return { ...base, oc: null, ocCount: 0 };
+  const override = await loadOcTemplateOverride(oc);
+  if (!override || override.length === 0) return { ...base, oc, ocCount: 0 };
+  const byId = new Map<string, CaseTemplate>(base.templates.map((t) => [t.id, t]));
+  for (const e of override) {
+    if ("_remove" in e && e._remove === true) {
+      byId.delete(e.id);
+      continue;
+    }
+    if (isPatchEntry(e)) {
+      // Patch a master template when present. When the id is not in the master
+      // set (an AI-generated case), the patch still applies at generation time
+      // via the oc-overlay — the effective preview just can't show it here.
+      const t = byId.get(e.id);
+      if (t) byId.set(e.id, applyCasePatch(t, e));
+      continue;
+    }
+    byId.set(e.id, e as CaseTemplate); // replace existing or add new
+  }
+  return { templates: [...byId.values()], source: base.source, oc, ocCount: override.length };
+}
+
 function substituteTokens(value: string, tokens: TemplateTokens): string {
   return value
     .replace(/\{\{betMin\}\}/g, tokens.betMin != null ? String(tokens.betMin) : "{{betMin}}")
@@ -980,6 +1395,37 @@ export async function applyTemplateSet(
     const existingIds = new Set(existing.cases.map((c) => c.id));
     const fresh = applied.filter((c) => !existingIds.has(c.id));
     cases = [...existing.cases, ...fresh];
+  }
+
+  // Per-operator (oc) overlay — applied LAST so an admin's oc rule wins over
+  // BOTH AI-generated and master-template cases of the same id. Each entry
+  // replaces the case verbatim (setup used as-is, only {{token}} substitution —
+  // no AI re-authoring), adds new ids, or drops a case via { _remove: true }.
+  // Takes effect on every future game of this oc; existing games are untouched
+  // until they regenerate. No-op when the game has no oc or no override file.
+  const oc = await operatorForSlug(slug);
+  const ocEntries = oc ? await loadOcTemplateOverride(oc) : null;
+  if (ocEntries && ocEntries.length > 0) {
+    let overridden = 0, added = 0, removed = 0, patched = 0, patchMiss = 0;
+    for (const e of ocEntries) {
+      if ("_remove" in e && e._remove === true) {
+        const before = cases.length;
+        cases = cases.filter((c) => c.id !== e.id);
+        if (cases.length < before) removed++;
+        continue;
+      }
+      if (isPatchEntry(e)) {
+        // Patch the generated case in place (AI or template origin), keeping its
+        // game-specific values and only applying the requested step/assertion ops.
+        const at = cases.findIndex((c) => c.id === e.id);
+        if (at >= 0) { cases[at] = applyCasePatch(cases[at]!, e); patched++; } else { patchMiss++; }
+        continue;
+      }
+      const inst = instantiateTemplate(e as CaseTemplate, tokens);
+      const at = cases.findIndex((c) => c.id === inst.id);
+      if (at >= 0) { cases[at] = inst; overridden++; } else { cases.push(inst); added++; }
+    }
+    console.log(`[case-templates/oc-overlay] ${slug} oc=${oc}: overridden=${overridden} added=${added} removed=${removed} patched=${patched} patchMiss=${patchMiss}`);
   }
 
   const catalog: TestCaseCatalog = {

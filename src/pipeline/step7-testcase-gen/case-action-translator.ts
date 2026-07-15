@@ -61,6 +61,10 @@ export type TranslatedCase = {
   actions: CaseAction[];
   /** Reason if the AI translator couldn't produce actions. */
   skipReason?: string;
+  /** Signature of the per-operator actionPatches already applied to `actions`
+   *  (see applyOcActionOverlay). Guards against re-applying non-idempotent ops
+   *  (e.g. insertAfter) when the overlay runs again over an unchanged cache. */
+  ocPatchSig?: string;
 };
 
 export type CaseActionsCache = {

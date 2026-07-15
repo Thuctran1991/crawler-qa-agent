@@ -106,6 +106,12 @@ export async function phaseTranslateCases(args: {
   try {
     const before = (await loadAiCatalog(slug))?.cases.length ?? 0;
     const result = await translateAllCases(slug, catalog.cases, uiMap, specForTranslate);
+    // Apply per-operator action-level patches (e.g. wait 800→500) on top of the
+    // freshly translated actions. No-op when the game's oc has no actionPatches.
+    const { applyOcActionOverlay } = await import("../step7-testcase-gen/case-templates.js");
+    await applyOcActionOverlay(slug).catch((err) => {
+      console.warn(`[phase/translate-cases] oc action-overlay failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    });
     const total = Object.keys(result.cases).length;
     // newCount derived approximately — translateAllCases skips already-cached
     // cases. The function itself logs new vs cached; here we just report total.

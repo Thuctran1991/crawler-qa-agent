@@ -33,6 +33,7 @@ import type { ReplaySample } from "../step8-run-scenarios/spec-replay-gate.js";
 import { parserCache } from "../registry/parser-cache.js";
 import { uiRegistry } from "../registry/ui-registry.js";
 import { initMeta, meta } from "../registry/meta.js";
+import { extractOperator } from "../../utils/url.js";
 import { providerCache } from "../registry/provider-cache.js";
 import { gameSpecOverride, applyOverride, type GameSpecOverride } from "../registry/game-spec-override.js";
 import { gameMechanics, deriveGameMechanics } from "../registry/game-mechanics.js";
@@ -5206,6 +5207,44 @@ CHECK_CODE RULES
     const reg = (this.gameSlug === slug && this.registry) ? this.registry : await uiRegistry.load(slug);
     if (!reg) return { ok: false, reason: "no registry available" };
 
+    // Apply the per-oc SETUP-level override (setSetup / removeSteps / addSteps /
+    // full-case) BEFORE translating, so per-case Re-translate reflects the oc
+    // rule the same way Generate Cases does — and persist it so the dashboard
+    // shows the updated SETUP INSTRUCTIONS. Action-level (actionPatches) runs
+    // AFTER translation below. Note: setSetup/removeSteps are idempotent on a
+    // persisted setup; addSteps may re-append on repeated Re-translate (prefer
+    // setSetup for full rewrites, or Generate Cases which starts from fresh AI).
+    try {
+      const { operatorForSlug } = await import("../registry/meta.js");
+      const { loadOcTemplateOverride, isPatchEntry, applyCasePatch } = await import("../step7-testcase-gen/case-templates.js");
+      const oc = await operatorForSlug(slug);
+      const entry = oc ? (await loadOcTemplateOverride(oc))?.find((e) => e.id === caseId) : undefined;
+      if (entry && !("_remove" in entry && (entry as { _remove?: unknown })._remove === true)) {
+        let nextSetup = tc.setup_instructions ?? "";
+        let nextAssertions = tc.custom_assertions;
+        if (isPatchEntry(entry)) {
+          const patched = applyCasePatch({ setup_instructions: nextSetup, custom_assertions: tc.custom_assertions ?? [] }, entry);
+          nextSetup = patched.setup_instructions ?? nextSetup;
+          nextAssertions = patched.custom_assertions;
+        } else {
+          const full = entry as { setup_instructions?: string; custom_assertions?: typeof tc.custom_assertions };
+          if (typeof full.setup_instructions === "string") nextSetup = full.setup_instructions;
+          if (Array.isArray(full.custom_assertions)) nextAssertions = full.custom_assertions;
+        }
+        if (nextSetup !== (tc.setup_instructions ?? "") || nextAssertions !== tc.custom_assertions) {
+          tc.setup_instructions = nextSetup;
+          tc.custom_assertions = nextAssertions;
+          const { loadRawCatalog, saveCatalog } = await import("../step7-testcase-gen/ai-catalog.js");
+          const raw = await loadRawCatalog(slug);
+          const rc = raw?.cases.find((c) => c.id === caseId);
+          if (raw && rc) { rc.setup_instructions = nextSetup; rc.custom_assertions = nextAssertions; await saveCatalog(slug, raw); }
+          console.log(`[manual/retranslate] ${slug}/${caseId}: applied oc setup override (${nextSetup.length} chars)`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[manual/retranslate] oc setup-override failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     const translated = await translateCase({
       caseId: tc.id,
       caseName: tc.name,
@@ -5234,7 +5273,20 @@ CHECK_CODE RULES
     cache.generatedAt = new Date().toISOString();
     await saveActionsCache(slug, cache);
 
-    return { ok: true, actions: translated.actions, skipReason: translated.skipReason, aiCalled, resynced };
+    // Apply per-operator action-level patches on top of the fresh translation.
+    let finalActions = translated.actions;
+    try {
+      const { applyOcActionOverlay } = await import("../step7-testcase-gen/case-templates.js");
+      const r = await applyOcActionOverlay(slug, { caseId });
+      if (r.patched > 0) {
+        const after = await loadActionsCache(slug);
+        finalActions = after?.cases[caseId]?.actions ?? translated.actions;
+      }
+    } catch (err) {
+      console.warn(`[manual/retranslate] oc action-overlay failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return { ok: true, actions: finalActions, skipReason: translated.skipReason, aiCalled, resynced };
   }
 
   /**
@@ -5542,6 +5594,13 @@ CHECK_CODE RULES
     }
     cache.generatedAt = new Date().toISOString();
     await saveActionsCache(slug, cache);
+    // Apply per-operator action-level patches on top of the fresh translations.
+    try {
+      const { applyOcActionOverlay } = await import("../step7-testcase-gen/case-templates.js");
+      await applyOcActionOverlay(slug);
+    } catch (err) {
+      console.warn(`[manual/retranslate-all] oc action-overlay failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
     return { ok: true, total: candidates.length, succeeded, stillSkipped };
   }
 
@@ -6838,6 +6897,9 @@ export type RegisteredGame = {
   gameName?: string;
   /** Provider label from provider-cache (e.g. "Pragmatic" / "Generic"). */
   provider?: string;
+  /** Operator / casino code ("oc") from the game URL. Used by the dashboard to
+   *  show the OC chip + scope the per-operator rule editor. Null when unknown. */
+  operator?: string | null;
   createdAt: string;
   lastValidatedAt?: string;
   elementCount: number;
@@ -6987,6 +7049,7 @@ export async function listRegisteredGames(): Promise<RegisteredGame[]> {
         clonedFromSlug: m.clonedFromSlug,
         gameName: pc?.gameName,
         provider: pc?.provider,
+        operator: m.operator ?? extractOperator(m.gameUrl),
         createdAt: m.createdAt,
         lastValidatedAt: m.lastValidatedAt,
         elementCount: Object.keys(reg).length,

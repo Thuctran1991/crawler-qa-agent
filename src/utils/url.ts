@@ -42,6 +42,59 @@ const SLUG_SKIP = new Set([
   "client",
 ]);
 
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * Extract the operator / casino code ("oc") from a game launch URL.
+ *
+ * Playtech GPAS URLs carry the operator in the HASH FRAGMENT
+ * (`#...&casino=ptdemo`) and inside the encoded `backurl` param
+ * (`...&operator=ptdemo`), NOT the top-level query string — so
+ * `URL.searchParams.get("oc"/"operator")` alone returns null for them.
+ *
+ * Resolution order (first hit wins), all lowercased:
+ *   1. top-level query `?oc=` / `?operator=`
+ *   2. hash fragment params `oc=` / `operator=` / `casino=`
+ *   3. `operator=` / `oc=` / `casino=` anywhere in the URL-decoded raw string
+ *      (covers a nested/encoded backurl or returnUrl).
+ * Returns null when none is found.
+ */
+export function extractOperator(raw: string): string | null {
+  const norm = (v: string | null | undefined): string | null => {
+    const s = (v ?? "").trim();
+    return s ? s.toLowerCase() : null;
+  };
+  let u: URL | null = null;
+  try {
+    u = new URL(raw);
+  } catch {
+    u = null;
+  }
+  if (u) {
+    // 1. top-level query
+    const q = norm(u.searchParams.get("oc") ?? u.searchParams.get("operator"));
+    if (q) return q;
+    // 2. hash fragment (strip leading '#', parse as a query string)
+    if (u.hash) {
+      const frag = new URLSearchParams(u.hash.replace(/^#/, ""));
+      const f = norm(frag.get("oc") ?? frag.get("operator") ?? frag.get("casino"));
+      if (f) return f;
+    }
+  }
+  // 3. last resort — scan the decoded raw string for an operator/oc/casino
+  //    param (handles a percent-encoded backurl carrying it).
+  const decoded = safeDecode(raw);
+  const m = decoded.match(/[?&#](?:operator|oc)=([^&#\s]+)/i)
+    ?? decoded.match(/[?&#]casino=([^&#\s]+)/i);
+  return m ? norm(m[1]) : null;
+}
+
 export function parseGameUrl(raw: string): GameUrlInfo {
   const u = new URL(raw);
   const segments = u.pathname.split("/").filter(Boolean);
@@ -75,7 +128,7 @@ export function parseGameUrl(raw: string): GameUrlInfo {
     provider,
     providerName,
     token: u.searchParams.get("t") ?? u.searchParams.get("token"),
-    operator: u.searchParams.get("oc") ?? u.searchParams.get("operator"),
+    operator: extractOperator(raw),
     lang: u.searchParams.get("l") ?? u.searchParams.get("lang"),
     returnUrl: u.searchParams.get("r") ?? u.searchParams.get("return"),
   };

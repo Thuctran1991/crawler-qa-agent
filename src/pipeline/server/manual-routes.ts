@@ -668,6 +668,63 @@ export async function handleManualRoute(
       }), true;
     }
 
+    // GET/PUT/DELETE /api/qa/manual/oc-templates?oc=<oc>
+    // Per-operator (OC) case rule override. Layered ON TOP of the master
+    // template set (standard.json / built-in): same-id entries replace a case
+    // verbatim, new ids add, `{ id, _remove: true }` drops one. Applied at
+    // generation to every FUTURE game of that oc (see applyTemplateSet
+    // oc-overlay). Stored at fixtures/case-templates/by-oc/<oc>.json.
+    if (url?.startsWith("/api/qa/manual/oc-templates") && method === "GET") {
+      const oc = new URL(url, "http://x").searchParams.get("oc");
+      if (!oc?.trim()) return sendJson(res, 400, { ok: false, error: "oc query param required" }), true;
+      const { loadOcTemplateOverride, loadCaseTemplatesForOc, ocOverridePath } = await import("../step7-testcase-gen/case-templates.js");
+      const override = (await loadOcTemplateOverride(oc)) ?? [];
+      const effective = await loadCaseTemplatesForOc(oc);
+      return sendJson(res, 200, {
+        ok: true,
+        oc,
+        path: ocOverridePath(oc),
+        override,
+        overrideCount: override.length,
+        effective: effective.templates,
+        masterSource: effective.source,
+      }), true;
+    }
+
+    if (url === "/api/qa/manual/oc-templates" && method === "PUT") {
+      const body = await asJsonBody<{ oc?: string; templates?: unknown }>(req);
+      if (!body.oc?.trim()) return sendJson(res, 400, { ok: false, error: "oc required" }), true;
+      const { saveOcTemplateOverride, validateOcTemplateOverride, loadCaseTemplatesForOc } = await import("../step7-testcase-gen/case-templates.js");
+      const valid = validateOcTemplateOverride(body.templates);
+      if (!valid.ok) return sendJson(res, 400, { ok: false, error: valid.reason }), true;
+      const savedPath = await saveOcTemplateOverride(body.oc, valid.entries);
+      const effective = await loadCaseTemplatesForOc(body.oc);
+      return sendJson(res, 200, {
+        ok: true,
+        oc: body.oc,
+        path: savedPath,
+        override: valid.entries,
+        overrideCount: valid.entries.length,
+        effective: effective.templates,
+      }), true;
+    }
+
+    if (url?.startsWith("/api/qa/manual/oc-templates") && method === "DELETE") {
+      const oc = new URL(url, "http://x").searchParams.get("oc");
+      if (!oc?.trim()) return sendJson(res, 400, { ok: false, error: "oc query param required" }), true;
+      const { resetOcTemplateOverride, loadCaseTemplatesForOc } = await import("../step7-testcase-gen/case-templates.js");
+      const removedPath = await resetOcTemplateOverride(oc);
+      const effective = await loadCaseTemplatesForOc(oc);
+      return sendJson(res, 200, {
+        ok: true,
+        oc,
+        path: removedPath,
+        override: [],
+        overrideCount: 0,
+        effective: effective.templates,
+      }), true;
+    }
+
     // POST /api/qa/manual/case-templates/case/generate
     // QA describes a whole reusable case in plain language; AI returns a full
     // CaseTemplate object. The UI previews it and appends it to the active JSON

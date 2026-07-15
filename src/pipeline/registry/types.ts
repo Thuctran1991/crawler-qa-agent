@@ -302,6 +302,10 @@ export type RegistryMeta = {
   recordSlug?: string;
   clonedFromSlug?: string;
   gameVersionHash?: string;
+  /** Operator / casino code ("oc") derived from the game launch URL, used to
+   *  scope per-operator case-generation rule overrides. Auto-filled by
+   *  initMeta via extractOperator(gameUrl); null when the URL carries none. */
+  operator?: string | null;
 };
 
 export type ValidationResult = {

@@ -1,0 +1,16 @@
+[
+  {
+    "id": "base-default-bet-single-spin",
+    "actionPatches": [
+      {
+        "op": "setWaitMs",
+        "from": 800,
+        "to": 500
+      }
+    ]
+  },
+  {
+    "id": "bet-boundary-above-max",
+    "setSetup": "Step 1: Locate the bet controls (betPlus at ~178,465 per UI registry). Step 2: Read the current bet value on the play screen bet display.  Step 3: Verify the bet display still reads exactly '8.00' (UI clamped — did not increase past 8.00) before the test loop begins."
+  }
+]

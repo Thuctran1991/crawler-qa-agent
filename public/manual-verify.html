@@ -1885,10 +1885,16 @@
           const identityLine = (g.baseGameSlug || g.currency || g.language)
             ? `<div style="font-size:11px;color:#6f7a89;margin-top:2px;">base=<code>${escapeHtml(g.baseGameSlug || g.gameSlug)}</code>${g.currency ? ` · ${escapeHtml(g.currency)}` : ""}${g.language ? ` · ${escapeHtml(g.language)}` : ""}${g.clonedFromSlug ? ` · cloned from <code>${escapeHtml(g.clonedFromSlug)}</code>` : ""}</div>`
             : "";
+          const ocChip = g.operator
+            ? `<span style="display:inline-block;margin-top:3px;font-size:10px;font-weight:700;color:#c4b5fd;background:#2e2450;padding:1px 7px;border-radius:8px;" title="Operator (oc) — scopes the per-operator case rules">OC: ${escapeHtml(g.operator)}</span>`
+            : `<span style="display:inline-block;margin-top:3px;font-size:10px;color:#6f7a89;" title="No operator (oc) detected in this game URL — per-operator rules unavailable">OC: —</span>`;
           const nameCell = (g.gameName && g.gameName !== g.gameSlug)
             ? `<div style="font-weight:600;color:#e6edf3;font-size:13px;">${escapeHtml(g.gameName)}${activeBadge}</div>
-               <div style="font-size:11px;color:#8b939c;margin-top:2px;"><code>${g.gameSlug}</code>${g.provider ? ` · ${escapeHtml(g.provider)}` : ""}</div>${identityLine}`
-            : `<div style="font-weight:600;color:#e6edf3;font-size:13px;"><code>${g.gameSlug}</code>${activeBadge}</div>${g.provider ? `<div style="font-size:11px;color:#8b939c;margin-top:2px;">${escapeHtml(g.provider)}</div>` : ""}${identityLine}`;
+               <div style="font-size:11px;color:#8b939c;margin-top:2px;"><code>${g.gameSlug}</code>${g.provider ? ` · ${escapeHtml(g.provider)}` : ""}</div>${identityLine}<div>${ocChip}</div>`
+            : `<div style="font-weight:600;color:#e6edf3;font-size:13px;"><code>${g.gameSlug}</code>${activeBadge}</div>${g.provider ? `<div style="font-size:11px;color:#8b939c;margin-top:2px;">${escapeHtml(g.provider)}</div>` : ""}${identityLine}<div>${ocChip}</div>`;
+          const ocRulesBtn = g.operator
+            ? `<button class="gray" onclick="openOcRulesEditor('${escapeHtml(g.operator)}','${g.gameSlug}')" title="Edit case-generation rules for operator '${escapeHtml(g.operator)}' — applies to every future game of this oc">⚙ OC Rules</button>`
+            : `<button class="gray" disabled style="opacity:0.5;cursor:not-allowed;" title="No operator (oc) in this game URL — cannot scope per-operator rules">⚙ OC Rules</button>`;
           // Open (when idle) OR Stop & Save (when this row's session is active).
           const openOrStop = isActive
             ? `<button class="red" onclick="doStopSession()" title="Stop & save the active session for this game">Stop &amp; Save</button>
@@ -1905,6 +1911,7 @@
           <td style="white-space: nowrap;">
             ${openOrStop}
             <button class="gray" onclick="openCaseTemplateEditor()" title="Edit the reusable base case templates before Generate Cases">Manage Templates</button>
+            ${ocRulesBtn}
             <button class="purple" onclick="doGenerateCases('${g.gameSlug}')" title="Generate test cases (AI catalog + translations only — stops here)">Generate Cases</button>
             <button class="gray" onclick="doLoadCases('${g.gameSlug}')" title="Load cases from disk (no session needed)">Load Cases</button>
             <button style="background: #4f7cff;" onclick="doRunStats('${g.gameSlug}')" title="Massive spin + RTP/hit-rate/volatility stats only (no case execution)">Run Stats</button>
@@ -2135,6 +2142,135 @@
         toast(`Saved ${body.count ?? templates.length} base templates. Next Generate Cases will use them.`);
       } catch (err) {
         setCaseTemplateError(err.message || String(err));
+      }
+    };
+
+    // ── Per-operator (OC) case rule editor ──────────────────────────────
+    // Opened from a game row's "⚙ OC Rules" button. Edits
+    // fixtures/case-templates/by-oc/<oc>.json — an override layered on top of
+    // the master template set. Each entry replaces a case by id verbatim
+    // (setup used as-is, no AI re-authoring), adds a new case, or drops one
+    // via { "id": "...", "_remove": true }. Applies to every FUTURE game of
+    // this oc at Generate Cases time; existing games are untouched.
+    window.__ocEditor = null;
+
+    window.openOcRulesEditor = async (oc, slug) => {
+      if (!oc) return toast("This game has no operator (oc) — cannot scope rules", true);
+      // Fetch current override + the game's catalog cases (for Import).
+      let payload, catalog;
+      try {
+        [payload, catalog] = await Promise.all([
+          api(`/api/qa/manual/oc-templates?oc=${encodeURIComponent(oc)}`),
+          api(`/api/qa/manual/cases?game=${encodeURIComponent(slug)}`).catch(() => ({ cases: [] })),
+        ]);
+      } catch (err) {
+        return toast(`Failed to load OC rules: ${err.message}`, true);
+      }
+      const cases = Array.isArray(catalog?.cases) ? catalog.cases : [];
+      window.__ocEditor = { oc, slug, cases };
+      const initialJson = JSON.stringify(payload.override ?? [], null, 2);
+      const effJson = JSON.stringify(payload.effective ?? [], null, 2);
+      const importOptions = cases.length
+        ? cases.map((c) => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.id)} — ${escapeHtml((c.name || "").slice(0, 60))}</option>`).join("")
+        : `<option value="">(no cases on disk — run Load/Generate Cases first)</option>`;
+
+      document.getElementById("ocRulesModal")?.remove();
+      const modal = document.createElement("div");
+      modal.id = "ocRulesModal";
+      modal.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;";
+      modal.innerHTML = `
+        <div style="background:#0f1319;border:1px solid #232a35;border-radius:8px;width:min(920px,94vw);max-height:90vh;display:flex;flex-direction:column;padding:16px;gap:10px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="font-size:14px;color:#c8d0d8;">⚙ OC Rules — <code style="color:#c4b5fd;">${escapeHtml(oc)}</code></div>
+            <button onclick="document.getElementById('ocRulesModal').remove()" style="background:transparent;border:1px solid #2a3140;color:#8b939c;font-size:12px;padding:4px 10px;">✕ Close</button>
+          </div>
+          <div style="font-size:11px;color:#8b939c;">Overrides the master template set for this operator. Each entry either <strong>patches</strong> a case by <code>id</code> (removeSteps / addSteps / addAssertions / removeAssertions — works on AI-generated cases, matched by text), <strong>replaces</strong> a case verbatim (full case object), or drops one via <code>{"id":"…","_remove":true}</code>. Applies to every <strong>future</strong> game of <code>${escapeHtml(oc)}</code>. Path: <code>${escapeHtml(payload.path || "")}</code></div>
+          <div style="display:flex;gap:6px;align-items:center;background:#0b0e13;border:1px solid #232a35;border-radius:4px;padding:8px;">
+            <span style="font-size:11px;color:#8b939c;">Import case from <code>${escapeHtml(slug)}</code>:</span>
+            <select id="ocImportSelect" style="flex:1;background:#0f1319;color:#dde1e6;border:1px solid #2a3140;font-size:11px;padding:4px;">${importOptions}</select>
+            <button onclick="window.ocImportCase()" style="background:#3b82f6;font-size:11px;padding:4px 10px;"${cases.length ? "" : " disabled"}>Load into editor →</button>
+          </div>
+          <textarea id="ocRulesTextarea" spellcheck="false" style="background:#0b0e13;color:#dde1e6;border:1px solid #232a35;border-radius:4px;padding:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5;resize:vertical;min-height:280px;flex:1;">${escapeHtml(initialJson)}</textarea>
+          <div id="ocRulesError" style="display:none;color:#f0a39e;font-size:11px;font-family:ui-monospace,monospace;background:#2a1414;border:1px solid #d9534f;border-radius:4px;padding:6px 10px;"></div>
+          <details style="font-size:11px;color:#8b939c;">
+            <summary style="cursor:pointer;">▸ Effective set (master + oc) — ${(payload.effective ?? []).length} cases</summary>
+            <pre style="background:#0b0e13;border:1px solid #232a35;border-radius:4px;padding:8px;margin:6px 0 0;font-size:11px;max-height:220px;overflow:auto;">${escapeHtml(effJson)}</pre>
+          </details>
+          <div style="font-size:11px;color:#6f7a89;">Tip: edit <code>setup_instructions</code> to remove any step; saved verbatim by <code>id</code>. NEW games of this oc generated afterwards use this exact setup (no AI rewrite).</div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button onclick="document.getElementById('ocRulesModal').remove()" style="background:#3a3f4a;font-size:12px;">Cancel</button>
+            <button onclick="window.resetOcRules()" style="background:#7a4a12;font-size:12px;" title="Delete the oc override file (revert to master templates)">♻ Reset oc</button>
+            <button onclick="window.saveOcRules()" style="background:#16a34a;font-size:12px;">💾 Save</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+    };
+
+    function setOcRulesError(msg) {
+      const box = document.getElementById("ocRulesError");
+      if (!box) return;
+      if (!msg) { box.style.display = "none"; box.textContent = ""; return; }
+      box.textContent = msg;
+      box.style.display = "block";
+    }
+
+    window.ocImportCase = () => {
+      const ed = window.__ocEditor;
+      const sel = document.getElementById("ocImportSelect");
+      const ta = document.getElementById("ocRulesTextarea");
+      if (!ed || !sel || !ta) return;
+      const caseId = sel.value;
+      const c = ed.cases.find((x) => x.id === caseId);
+      if (!c) return setOcRulesError(`Case "${caseId}" not found in catalog.`);
+      // Build a full CaseTemplate entry from the catalog case (setup verbatim).
+      const entry = {
+        id: c.id,
+        name: c.name || c.id,
+        description: c.name || c.id,
+        category: c.category,
+        severity: c.severity,
+        setup_instructions: c.setupInstructions || "",
+        custom_assertions: Array.isArray(c.assertions) ? c.assertions : [],
+      };
+      let arr;
+      try { arr = JSON.parse(ta.value || "[]"); } catch (err) { return setOcRulesError(`Invalid JSON: ${err.message}`); }
+      if (!Array.isArray(arr)) return setOcRulesError("Editor JSON must be an array.");
+      const at = arr.findIndex((e) => e?.id === c.id);
+      if (at >= 0) arr[at] = entry; else arr.push(entry);
+      ta.value = JSON.stringify(arr, null, 2);
+      setOcRulesError("");
+      toast(`Loaded "${c.id}" — edit setup, then Save`);
+    };
+
+    window.saveOcRules = async () => {
+      const ed = window.__ocEditor;
+      const ta = document.getElementById("ocRulesTextarea");
+      if (!ed || !ta) return;
+      let entries;
+      try { entries = JSON.parse(ta.value); } catch (err) { return setOcRulesError(`Invalid JSON: ${err.message}`); }
+      if (!Array.isArray(entries)) return setOcRulesError("Top-level must be an array of case entries.");
+      try {
+        const r = await api("/api/qa/manual/oc-templates", { method: "PUT", body: { oc: ed.oc, templates: entries } });
+        if (!r.ok) return setOcRulesError(r.error || "Save failed");
+        setOcRulesError("");
+        toast(`✓ Saved ${r.overrideCount} OC rule(s) for ${ed.oc}. Future ${ed.oc} games will use them.`);
+        document.getElementById("ocRulesModal")?.remove();
+      } catch (err) {
+        setOcRulesError(`Save error: ${err.message}`);
+      }
+    };
+
+    window.resetOcRules = async () => {
+      const ed = window.__ocEditor;
+      if (!ed) return;
+      if (!confirm(`Delete ALL OC rules for "${ed.oc}"?\n\nFuture ${ed.oc} games revert to the master templates. This does not change existing games.`)) return;
+      try {
+        const r = await api(`/api/qa/manual/oc-templates?oc=${encodeURIComponent(ed.oc)}`, { method: "DELETE" });
+        if (!r.ok) return setOcRulesError(r.error || "Reset failed");
+        toast(`✓ Reset OC rules for ${ed.oc}`);
+        document.getElementById("ocRulesModal")?.remove();
+      } catch (err) {
+        setOcRulesError(`Reset error: ${err.message}`);
       }
     };
 
